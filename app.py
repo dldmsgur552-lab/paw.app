@@ -1,54 +1,61 @@
-"""여행경비 최적화 — Python 3.11/3.12, Streamlit Community Cloud
-
-1) Supabase 프로젝트의 SQL Editor에서 아래 SQL을 1회 실행하세요.
-create table if not exists public.travel_budgets (
-    id text primary key,
-    document jsonb not null,
-    version integer not null default 1
-);
-alter table public.travel_budgets enable row level security;
-revoke all on public.travel_budgets from anon, authenticated;
-grant select, insert, update on public.travel_budgets to service_role;
--- 공개 접근 정책은 생성하지 마세요. 서버 전용 키만 이 테이블에 접근합니다.
-
-2) GitHub에 app.py, requirements.txt 업로드 → Streamlit Cloud에서 app.py 배포.
-   Python 3.11 또는 3.12 권장. Advanced settings > Secrets에 아래 TOML 입력:
-SUPABASE_URL = "https://YOUR-PROJECT.supabase.co"
-SUPABASE_SERVICE_ROLE_KEY = "YOUR-SERVICE-ROLE-KEY"
-APP_URL = "https://YOUR-APP.streamlit.app"
-
-서비스 키는 GitHub, QR, 클라이언트 코드에 넣지 마세요. 서버 Secrets 전용입니다.
-APP_URL은 배포 후 설정해도 됩니다. 앱 안에서 QR을 표시·다운로드합니다.
-로컬 실행: streamlit run app.py (로컬 Secrets는 .streamlit/secrets.toml)
-
-여행 비밀코드는 120비트 무작위 문자열이며 DB에는 SHA-256 해시만 저장합니다.
-비밀코드 소지자는 여행을 조회·수정할 수 있고, 분실하면 복구할 수 없습니다.
-새로고침 후 비밀코드 재입력이 필요하지만 DB 데이터는 유지됩니다.
-사용자 세션의 저장은 즉시 반영되며 다른 기기의 변경은 '새로 불러오기'로 반영합니다.
+"""여행경비 최적화 — 설정/DB/API 키 없이 실행, Python 3.11/3.12 권장.
+GitHub에 app.py, requirements.txt 업로드 → Streamlit Cloud에서 app.py 배포.
+실행: streamlit run app.py
+브라우저 localStorage에 자동 저장. 다른 기기/브라우저와 공유되지 않습니다.
+시크릿 모드, 브라우저 데이터 삭제, 앱 주소 변경 시 복원되지 않을 수 있습니다.
+JSON 백업을 보관하세요. QR에는 앱 주소만 포함하며 데이터는 포함하지 않습니다.
+Streamlit의 브라우저 통신 컴포넌트 파일은 실행 중 자동 생성됩니다.
 """
 from __future__ import annotations
-
 import copy
-import hashlib
+import csv
 import html
 import io
-import re
-import secrets
+import json
+import math
+from pathlib import Path
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import urlsplit
 
 import pandas as pd
 import qrcode
-import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
-CATS = ["교통비", "숙박비", "식비", "관광·체험비", "쇼핑비", "기타"]
-ICONS = dict(zip(CATS, ["🚆", "🏨", "🍜", "🎡", "🛍️", "📦"]))
-PAYMENTS = ["카드", "현금", "계좌이체", "간편결제", "기타"]
-PRIORITIES = {1: "1 · 꼭 필요한 지출", 2: "2 · 상황에 따라 필요", 3: "3 · 줄이거나 생략 가능"}
-LIMIT = 1_000_000_000_000
+CATS = ['교통비', '숙박비', '식비', '관광·체험비', '쇼핑비', '기타']
+ICONS = ['🚆', '🏨', '🍜', '🎡', '🛍️', '📦']
+PAY = ['카드', '현금', '간편결제', '계좌이체', '기타']
+PRI = {1: '1 · 꼭 필요', 2: '2 · 상황에 따라 필요', 3: '3 · 줄이거나 생략 가능'}
+LIMIT = 10**12
 KST = timezone(timedelta(hours=9))
+
+# Browser-local persistence via Streamlit's public component protocol.
+# No third-party scripts, external requests, cookies or shared server-side data files.
+COMPONENT_HTML = r'''<!doctype html><html><head><meta charset="utf-8"></head><body><script>
+const KEY='travel_budget_local_v2';
+function send(type,extra){window.parent.postMessage(Object.assign({isStreamlitMessage:true,type:type},extra||{}),'*');}
+let lastToken=null;
+window.addEventListener('message',function(event){
+ if(event.source!==window.parent || !event.data || event.data.type!=='streamlit:render')return;
+ const a=event.data.args;if(!a || a.token===lastToken)return;lastToken=a.token;
+ let result={token:a.token,ok:false};
+ try{
+  if(a.mode==='load'){
+   const raw=localStorage.getItem(KEY);
+   result.doc=raw===null?null:JSON.parse(raw);
+  }else if(a.mode==='save'){
+   const raw=JSON.stringify(a.doc);
+   localStorage.setItem(KEY,raw);
+   if(localStorage.getItem(KEY)!==raw)throw Error('verify');
+  }else throw Error('mode');
+  result.ok=true;
+ }catch(e){result.error=String(e.name||'StorageError');}
+ send('streamlit:setComponentValue',{value:result,dataType:'json'});
+});
+send('streamlit:componentReady',{apiVersion:1});
+send('streamlit:setFrameHeight',{height:0});
+</script></body></html>'''
 
 
 def today():
@@ -56,468 +63,323 @@ def today():
 
 
 def won(v):
-    return f"₩{int(v):,}"
+    return f'₩{int(v):,}'
 
 
-def date_list(start, end):
-    a, b = date.fromisoformat(start), date.fromisoformat(end)
-    length = (b - a).days + 1
-    if not 1 <= length <= 366:
-        raise ValueError("여행 기간은 1~366일로 입력해 주세요.")
-    return [(a + timedelta(days=i)).isoformat() for i in range(length)]
+def dates(a,b):
+    start,end=date.fromisoformat(a),date.fromisoformat(b)
+    n=(end-start).days+1
+    if not 1<=n<=366: raise ValueError('여행 기간은 1~366일이어야 합니다.')
+    return [(start+timedelta(days=i)).isoformat() for i in range(n)]
 
 
-def allocate(total, labels):
-    base, remainder = divmod(int(total), len(labels))
-    return {label: base + int(i < remainder) for i, label in enumerate(labels)}
+def split(total,labels):
+    q,r=divmod(int(total),len(labels))
+    return {k:q+int(i<r) for i,k in enumerate(labels)}
 
 
-def normalize(code):
-    return code.strip().replace("-", "").replace(" ", "").upper()
+def money(v):
+    return isinstance(v,int) and not isinstance(v,bool) and 0<=v<=LIMIT
 
 
-def code_hash(code):
-    return hashlib.sha256(normalize(code).encode()).hexdigest()
-
-
-def generate_code():
-    raw = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(24))
-    return "-".join(raw[i:i + 6] for i in range(0, 24, 6))
-
-
-def valid_money(v):
-    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= LIMIT
-
-
-def validate(doc):
-    if not str(doc["destination"]).strip() or len(doc["destination"]) > 100:
-        raise ValueError("여행지는 1~100자로 입력해 주세요.")
-    dates = date_list(doc["start"], doc["end"])
-    if not 1 <= doc["people"] <= 10000:
-        raise ValueError("여행 인원은 1~10,000명이어야 합니다.")
-    if not valid_money(doc["budget"]) or not doc["budget"]:
-        raise ValueError("전체 예산은 1원 이상의 정수여야 합니다.")
-    for key, labels in [("daily", dates), ("category", CATS)]:
-        if set(doc[key]) != set(labels) or not all(valid_money(v) for v in doc[key].values()):
-            raise ValueError("예산 배분은 빈칸 없이 0 이상의 정수로 입력해 주세요.")
-        if sum(doc[key].values()) != doc["budget"]:
-            raise ValueError("날짜별·카테고리별 합계가 각각 전체 예산과 일치해야 합니다.")
-    for field in ("plans", "expenses"):
-        ids = set()
-        for item in doc[field]:
-            if item["id"] in ids:
-                raise ValueError("중복된 항목입니다.")
-            ids.add(item["id"])
-            if item["date"] not in dates:
-                raise ValueError("기존 지출·계획이 여행 기간 밖에 있습니다. 해당 항목 날짜를 먼저 수정해 주세요.")
-            if item["category"] not in CATS or item["priority"] not in PRIORITIES:
-                raise ValueError("카테고리나 중요도를 확인해 주세요.")
-            if not item["description"].strip() or len(item["description"]) > 200:
-                raise ValueError("지출 내용은 1~200자로 입력해 주세요.")
-            if not valid_money(item["amount"]) or not item["amount"]:
-                raise ValueError("항목 금액은 1원 이상의 정수여야 합니다.")
-            if field == "expenses" and (not valid_money(item["expected"]) or item["payment"] not in PAYMENTS):
-                raise ValueError("비교용 계획액 또는 결제 수단을 확인해 주세요.")
-    pids = {p["id"] for p in doc["plans"]}
-    links = [e["plan_id"] for e in doc["expenses"] if e.get("plan_id")]
-    if len(links) != len(set(links)) or any(p not in pids for p in links):
-        raise ValueError("계획이 중복 결제되었거나 연결 정보를 찾을 수 없습니다.")
-
-
-def stats(doc):
-    spent = sum(e["amount"] for e in doc["expenses"])
-    left = doc["budget"] - spent
-    count = max(0, (date.fromisoformat(doc["end"]) - max(today(), date.fromisoformat(doc["start"]))).days + 1)
-    return spent, left, count
-
-
-def pending(doc):
-    paid = {e.get("plan_id") for e in doc["expenses"]}
-    return [p for p in doc["plans"] if p["id"] not in paid]
-
-
-def label(item):
-    return f"{item['date']} · {item['description']} · {won(item['amount'])}"
-
-
-class StorageError(Exception):
-    pass
-
-
-class Store:
-    def __init__(self, url, key):
-        self.url = url.rstrip("/") + "/rest/v1/travel_budgets"
-        self.headers = {"apikey": key, "Authorization": "Bearer " + key,
-                        "Content-Type": "application/json", "Prefer": "return=representation"}
-
-    def request(self, method, params=None, payload=None):
-        try:
-            response = requests.request(method, self.url, headers=self.headers, params=params,
-                                        json=payload, timeout=(8, 25))
-        except requests.RequestException:
-            raise StorageError("DB 연결이 불안정합니다. '새로 불러오기'로 저장 여부를 확인한 후 다시 시도하세요.") from None
-        if not response.ok:
-            raise StorageError(f"DB 요청 실패 (HTTP {response.status_code}). Supabase 프로젝트·테이블·서버 Secrets를 확인해 주세요.")
-        try:
-            return response.json()
-        except ValueError:
-            raise StorageError("DB 응답을 확인하지 못했습니다. 다시 불러와 저장 여부를 확인하세요.") from None
-
-    def load(self, ident):
-        rows = self.request("GET", {"id": "eq." + ident, "select": "document,version", "limit": "1"})
-        return rows[0] if rows else None
-
-    def create(self, ident, doc):
-        validate(doc)
-        rows = self.request("POST", payload={"id": ident, "document": doc, "version": 1})
-        if len(rows) != 1:
-            raise StorageError("생성 결과를 확인하지 못했습니다. 생성용 비밀코드로 다시 접속해 주세요.")
-        return rows[0]
-
-    def save(self, ident, version, doc):
-        validate(doc)
-        rows = self.request("PATCH", {"id": "eq." + ident, "version": "eq." + str(version)},
-                            {"document": doc, "version": version + 1})
-        if len(rows) != 1:
-            raise StorageError("다른 기기에서 먼저 변경했습니다. '새로 불러오기' 후 다시 입력해 주세요. 이번 수정은 저장되지 않았습니다.")
-        return rows[0]
-
-
-def adopt(row):
-    st.session_state.doc = row["document"]
-    st.session_state.version = row["version"]
-
-
-def save(store, doc):
+def validate(d):
     try:
-        adopt(store.save(st.session_state.ident, st.session_state.version, doc))
-        st.session_state.message = "저장 완료 ✓"
-        st.rerun()
-    except (StorageError, ValueError) as exc:
-        st.error(str(exc))
+        if not isinstance(d,dict) or d.get('schema')!=2: raise ValueError('백업 형식을 확인해 주세요.')
+        if not isinstance(d['destination'],str) or not 1<=len(d['destination'].strip())<=100: raise ValueError('여행지를 입력해 주세요.')
+        labels=dates(d['start'],d['end'])
+        if not isinstance(d['people'],int) or isinstance(d['people'],bool) or not 1<=d['people']<=10000: raise ValueError('인원은 1~10,000명입니다.')
+        if not money(d['budget']) or d['budget']==0: raise ValueError('전체 예산은 1원 이상입니다.')
+        for key,keys in [('daily',labels),('category',CATS)]:
+            if set(d[key])!=set(keys) or not all(money(v) for v in d[key].values()): raise ValueError('배분 금액은 0 이상의 정수여야 합니다.')
+            if sum(d[key].values())!=d['budget']: raise ValueError('날짜별·카테고리별 합계를 각각 전체 예산에 맞춰 주세요.')
+        for field in ['expenses','plans']:
+            if not isinstance(d[field],list) or len(d[field])>10000: raise ValueError('항목 수가 너무 많거나 형식이 잘못되었습니다.')
+            seen=set()
+            for e in d[field]:
+                if not isinstance(e['id'],str) or e['id'] in seen: raise ValueError('중복 항목입니다.')
+                seen.add(e['id'])
+                if e['date'] not in labels: raise ValueError('기존 지출·계획이 여행 기간 밖에 있습니다. 항목 날짜를 먼저 수정하세요.')
+                if e['category'] not in CATS or e['priority'] not in PRI: raise ValueError('항목 분류를 확인하세요.')
+                if not isinstance(e['description'],str) or not 1<=len(e['description'].strip())<=200: raise ValueError('내용은 1~200자로 입력하세요.')
+                if not money(e['amount']) or not e['amount']: raise ValueError('항목 금액은 1원 이상입니다.')
+                if field=='expenses' and (not money(e['expected']) or e['payment'] not in PAY): raise ValueError('계획액·결제 수단을 확인하세요.')
+        pids={p['id'] for p in d['plans']}
+        links=[e['plan_id'] for e in d['expenses'] if e.get('plan_id')]
+        if len(links)!=len(set(links)) or any(p not in pids for p in links): raise ValueError('계획 결제 연결이 잘못되었습니다.')
+    except (KeyError,TypeError,AttributeError,OverflowError):
+        raise ValueError('저장 데이터 형식이 올바르지 않습니다. 이 앱에서 받은 JSON 백업을 사용하세요.') from None
 
 
-def make_csv(doc):
-    rows = []
-    for kind, items in [("실제 지출", doc["expenses"]), ("미결제 계획", pending(doc))]:
+def totals(d):
+    spent=sum(e['amount'] for e in d['expenses'])
+    left=d['budget']-spent
+    n=max(0,(date.fromisoformat(d['end'])-max(today(),date.fromisoformat(d['start']))).days+1)
+    return spent,left,n
+
+
+def pending(d):
+    paid={e.get('plan_id') for e in d['expenses']}
+    return [p for p in d['plans'] if p['id'] not in paid]
+
+
+def label(e):
+    return f"{e['date']} · {e['description']} · {won(e['amount'])}"
+
+
+def new_doc(destination,start,end,people,budget):
+    return dict(schema=2,destination=destination.strip(),start=start,end=end,people=int(people),budget=int(budget),
+                daily=split(budget,dates(start,end)),category=split(budget,CATS),expenses=[],plans=[])
+
+
+def csv_data(d):
+    out=io.StringIO(newline=''); w=csv.writer(out)
+    w.writerow(['구분','날짜','카테고리','내용','금액(원)','계획액(원)','중요도','결제수단'])
+    for kind,items in [('실제 지출',d['expenses']),('미결제 계획',pending(d))]:
         for e in items:
-            rows.append({"여행지": doc["destination"], "구분": kind, "날짜": e["date"], "카테고리": e["category"],
-                         "내용": e["description"], "금액(원)": e["amount"], "계획금액(원)": e.get("expected", e["amount"]),
-                         "중요도": e["priority"], "결제수단": e.get("payment", "")})
-    frame = pd.DataFrame(rows, columns=["여행지", "구분", "날짜", "카테고리", "내용", "금액(원)", "계획금액(원)", "중요도", "결제수단"])
-    for column in ("여행지", "내용"):
-        frame[column] = frame[column].map(lambda v: "'" + v if v.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")) else v)
-    return frame.to_csv(index=False).encode("utf-8-sig")
+            text=e['description']
+            if text.lstrip().startswith(('=','+','-','@','\t','\r')): text="'"+text
+            w.writerow([kind,e['date'],e['category'],text,e['amount'],e.get('expected',e['amount']),e['priority'],e.get('payment','')])
+    return out.getvalue().encode('utf-8-sig')
 
 
-def item_editor(store, doc, key, plan=False, existing=None, seed=None):
-    base = existing or seed or {}
-    a, b = date.fromisoformat(doc["start"]), date.fromisoformat(doc["end"])
-    initial = date.fromisoformat(base["date"]) if base else min(max(today(), a), b)
-    # Do not wrap in st.form: warnings must respond before the final save button.
-    day = st.date_input("예정일" if plan else "지출일", value=initial, min_value=a, max_value=b, key=key + "date")
-    cat = st.selectbox("카테고리", CATS, index=CATS.index(base.get("category", CATS[0])),
-                       format_func=lambda c: ICONS[c] + " " + c, key=key + "cat")
-    desc = st.text_input("지출 내용", value=base.get("description", ""), placeholder="예: 공항 → 숙소 이동", max_chars=200, key=key + "desc")
-    amount = int(st.number_input("예정 금액 (₩)" if plan else "실제 금액 (₩)", min_value=1, max_value=LIMIT,
-                                 value=int(base.get("amount", 10000)), step=1000, key=key + "amount"))
-    priority = st.selectbox("중요도", list(PRIORITIES), index=base.get("priority", 1) - 1,
-                            format_func=PRIORITIES.get, key=key + "priority")
-    item = {"id": existing["id"] if existing else uuid.uuid4().hex, "date": day.isoformat(), "category": cat,
-            "description": desc.strip(), "amount": amount, "priority": priority}
-    accepted = True
-    if not plan:
-        expected = int(st.number_input("계획 금액 (₩, 미설정은 0)", min_value=0, max_value=LIMIT,
-                                       value=int(base.get("expected", seed["amount"] if seed else 0)), step=1000, key=key + "expected"))
-        payment = st.selectbox("결제 수단", PAYMENTS, index=PAYMENTS.index(base.get("payment", "카드")), key=key + "payment")
-        item.update(expected=expected, payment=payment,
-                    plan_id=existing.get("plan_id") if existing else (seed["id"] if seed else None))
-        _, left, _ = stats(doc)
-        after = left + (existing["amount"] if existing else 0) - amount
-        warning = False
-        if expected and amount > expected:
-            st.warning(f"계획보다 {won(amount - expected)} 비쌉니다. 구매·이용을 다시 검토해 주세요.")
-            warning = True
-        if after < 0:
-            st.error(f"이 지출을 확정하면 전체 예산을 {won(-after)} 초과합니다.")
-            warning = True
-        if warning:
-            signature = hashlib.sha256(repr(item | {"id": ""}).encode()).hexdigest()[:16]
-            accepted = st.checkbox("경고를 확인했고, 직접 지출을 결정합니다.", key=key + "ack" + signature)
-    if st.button("계획 저장" if plan else "지출 확정 · 저장", key=key + "save", type="primary", disabled=not accepted, use_container_width=True):
-        updated = copy.deepcopy(doc)
-        field = "plans" if plan else "expenses"
-        if existing:
-            updated[field] = [item if x["id"] == existing["id"] else x for x in updated[field]]
-        else:
-            updated[field].append(item)
-        save(store, updated)
+def persist(d):
+    try: validate(d)
+    except ValueError as ex:
+        st.error(str(ex)); return
+    st.session_state.storage_request={'mode':'save','token':uuid.uuid4().hex,'doc':d}
+    st.rerun()
 
 
-def login(store):
-    st.caption("여행 비밀코드로 어디서든 이어서 관리하세요.")
-    with st.expander("🔑 기존 여행 열기", expanded=True):
-        with st.form("login"):
-            code = st.text_input("여행 비밀코드", type="password", max_chars=64)
-            submitted = st.form_submit_button("여행 열기", use_container_width=True)
-        if submitted:
-            cleaned = normalize(code)
-            if not re.fullmatch(r"[A-HJ-NP-Z2-9]{24}", cleaned):
-                st.error("발급받은 24자리 비밀코드를 입력해 주세요. 하이픈은 생략해도 됩니다.")
-            else:
-                try:
-                    row = store.load(code_hash(code))
-                    if row:
-                        validate(row["document"])
-                        st.session_state.ident = code_hash(code)
-                        st.session_state.code = "-".join(cleaned[i:i + 6] for i in range(0, 24, 6))
-                        adopt(row)
-                        st.rerun()
-                    else:
-                        st.error("일치하는 여행이 없습니다. 비밀코드를 확인해 주세요.")
-                except (StorageError, ValueError) as exc:
-                    st.error(str(exc))
-    with st.expander("✨ 새 여행 만들기"):
-        with st.form("new_trip"):
-            destination = st.text_input("여행지", max_chars=100)
-            dates = st.date_input("여행 기간", value=(today(), today() + timedelta(days=2)))
-            people = int(st.number_input("여행 인원수", min_value=1, max_value=10000, value=1))
-            budget = int(st.number_input("전체 예산 (₩)", min_value=1, max_value=LIMIT, value=1000000, step=10000))
-            create = st.form_submit_button("여행 만들기", type="primary", use_container_width=True)
-        if create:
-            try:
-                if len(dates) != 2:
-                    raise ValueError("시작일과 종료일을 모두 선택해 주세요.")
-                a, b = (d.isoformat() for d in dates)
-                labels = date_list(a, b)
-                doc = {"destination": destination.strip(), "start": a, "end": b, "people": people, "budget": budget,
-                       "daily": allocate(budget, labels), "category": allocate(budget, CATS), "expenses": [], "plans": []}
-                validate(doc)
-                code = generate_code()
-                st.warning("생성용 비밀코드입니다. 먼저 복사해 두세요. 생성 중 연결이 끊겨도 이 코드로 다시 확인할 수 있습니다.")
-                st.code(code, language=None)
-                row = store.create(code_hash(code), doc)
-                st.session_state.ident = code_hash(code)
-                st.session_state.code = code
-                st.session_state.new_trip = True
-                adopt(row)
-                st.rerun()
-            except (StorageError, ValueError) as exc:
-                st.error(str(exc))
-    st.stop()
-
-
-def budget_settings(store, doc):
-    version = str(st.session_state.version)
-    destination = st.text_input("여행지", value=doc["destination"], max_chars=100, key="dest" + version)
-    dates = st.date_input("여행 기간", value=(date.fromisoformat(doc["start"]), date.fromisoformat(doc["end"])), key="dates" + version)
-    people = int(st.number_input("여행 인원수", min_value=1, max_value=10000, value=doc["people"], key="people" + version))
-    budget = int(st.number_input("전체 예산 (₩)", min_value=1, max_value=LIMIT, value=doc["budget"], step=10000, key="budget" + version))
-    st.caption(f"1인당 예산 {won(budget // people)} · 원 미만 버림")
-    if len(dates) != 2:
-        st.info("시작일과 종료일을 모두 선택해 주세요.")
-        return
-    a, b = (d.isoformat() for d in dates)
-    try:
-        labels = date_list(a, b)
-    except ValueError as exc:
-        st.error(str(exc))
-        return
-    auto = st.checkbox("날짜·카테고리 예산 균등 재배분", key="auto" + version)
-    daily = allocate(budget, labels) if auto else {day: doc["daily"].get(day, 0) for day in labels}
-    category = allocate(budget, CATS) if auto else doc["category"]
-    suffix = version + str(budget) + a + b + str(auto)
-    config = {"예산(원)": st.column_config.NumberColumn(min_value=0, max_value=LIMIT, step=1, required=True)}
-    st.caption("날짜별 합계와 카테고리별 합계가 각각 전체 예산과 같아야 합니다. 금액 셀을 눌러 수정하세요.")
-    day_frame = st.data_editor(pd.DataFrame([{"날짜": k, "예산(원)": v} for k, v in daily.items()]),
-                               disabled=["날짜"], hide_index=True, column_config=config, use_container_width=True, key="daily" + suffix)
-    cat_frame = st.data_editor(pd.DataFrame([{"카테고리": k, "예산(원)": v} for k, v in category.items()]),
-                               disabled=["카테고리"], hide_index=True, column_config=config, use_container_width=True, key="cat" + suffix)
-    values = list(day_frame["예산(원)"]) + list(cat_frame["예산(원)"])
-    if not all(pd.notna(v) and float(v).is_integer() and 0 <= v <= LIMIT for v in values):
-        st.error("빈칸·소수·음수 없이 입력해 주세요.")
-        return
-    daily = dict(zip(day_frame["날짜"], map(int, day_frame["예산(원)"])))
-    category = dict(zip(cat_frame["카테고리"], map(int, cat_frame["예산(원)"])))
-    st.caption(f"날짜 합계 {won(sum(daily.values()))} · 카테고리 합계 {won(sum(category.values()))} · 전체 {won(budget)}")
-    equal = sum(daily.values()) == sum(category.values()) == budget
-    if not equal:
-        st.warning("각 배분 합계를 전체 예산에 맞춰 주세요.")
-    if st.button("여행 정보 · 예산 저장", type="primary", use_container_width=True, disabled=not equal):
-        updated = copy.deepcopy(doc)
-        updated.update(destination=destination.strip(), start=a, end=b, people=people, budget=budget, daily=daily, category=category)
-        save(store, updated)
-
-
-def analysis(doc):
-    spent, _, _ = stats(doc)
-    rows = []
-    for cat in CATS:
-        actual = sum(e["amount"] for e in doc["expenses"] if e["category"] == cat)
-        rows.append({"카테고리": cat, "계획(원)": doc["category"][cat], "실제(원)": actual,
-                     "잔여(원)": doc["category"][cat] - actual, "지출 비율(%)": round(actual / spent * 100, 1) if spent else 0.0})
-    frame = pd.DataFrame(rows).set_index("카테고리")
-    st.bar_chart(frame[["계획(원)", "실제(원)"]], color=["#A4C9C1", "#137C66"], stack=False)
-    st.dataframe(frame, use_container_width=True)
-    if spent:
-        highest = max(rows, key=lambda r: r["실제(원)"])
-        st.info(f"가장 큰 지출: {ICONS[highest['카테고리']]} {highest['카테고리']} · {won(highest['실제(원)'])} · {highest['지출 비율(%)']}%")
-    daily_rows = []
-    for day in date_list(doc["start"], doc["end"]):
-        actual = sum(e["amount"] for e in doc["expenses"] if e["date"] == day)
-        daily_rows.append({"날짜": day, "계획(원)": doc["daily"][day], "실제(원)": actual, "잔여(원)": doc["daily"][day] - actual})
-    st.dataframe(pd.DataFrame(daily_rows).set_index("날짜"), use_container_width=True)
-    st.caption("잔여가 음수이면 해당 배정 예산을 초과했습니다. 일별 배정 잔액과 전체 잔여 예산은 별도입니다.")
-
-
-def sharing():
-    st.warning("비밀코드 소지자는 여행을 조회·수정할 수 있습니다. 분실 시 복구할 수 없으니 안전하게 보관하세요.")
-    if st.checkbox("비밀코드 표시"):
-        st.code(st.session_state.code, language=None)
-    st.caption("QR에는 앱 주소만 포함합니다. 비밀코드는 별도로 전달하세요. 민감한 개인정보는 입력하지 마세요.")
-    address = str(st.secrets.get("APP_URL", "")).strip()
-    try:
-        parsed = urlsplit(address)
-        valid = parsed.scheme == "https" and bool(parsed.hostname) and not any([parsed.query, parsed.fragment, parsed.username, parsed.password]) and not any(c.isspace() for c in address)
-    except ValueError:
-        valid = False
-    if valid:
-        buffer = io.BytesIO()
-        qrcode.make(address).save(buffer, format="PNG")
-        st.image(buffer.getvalue(), width=190, caption="여행경비 최적화 접속 QR")
-        st.download_button("QR코드 PNG 저장", buffer.getvalue(), "travel_app_qr.png", "image/png", use_container_width=True)
-        st.link_button("앱 주소 열기", address, use_container_width=True)
+def storage_gate():
+    folder=Path(__file__).resolve().parent/'.travel_browser_component'
+    folder.mkdir(exist_ok=True)
+    path=folder/'index.html'
+    if not path.exists() or path.read_text(encoding='utf-8')!=COMPONENT_HTML:
+        path.write_text(COMPONENT_HTML,encoding='utf-8')
+    bridge=components.declare_component('travel_local_storage_v2',path=str(folder))
+    if 'storage_request' not in st.session_state:
+        st.session_state.storage_request={'mode':'load','token':uuid.uuid4().hex}
+    req=st.session_state.storage_request
+    response=bridge(**req,key='travel_storage',default=None)
+    if response is None or response.get('token')!=req['token']:
+        st.info('이 브라우저의 여행 데이터를 확인하는 중입니다…')
+        st.caption('오래 멈추면 쿠키·사이트 저장소 차단을 해제하거나 일반 브라우저에서 다시 열어 주세요.')
+        st.stop()
+    if st.session_state.get('handled_token')==req['token']: return
+    st.session_state.handled_token=req['token']
+    if response.get('ok'):
+        d=req.get('doc') if req['mode']=='save' else response.get('doc')
+        if d is not None:
+            try: validate(d)
+            except ValueError as ex:
+                st.error('저장된 데이터를 읽지 못했습니다: '+str(ex))
+                st.session_state.storage_invalid=True
+                return
+        st.session_state.doc=d
+        st.session_state.storage_ok=True
+        st.session_state.storage_invalid=False
+        if req['mode']=='save':
+            st.session_state.revision=st.session_state.get('revision',0)+1
+            st.session_state.notice='이 브라우저에 저장 완료 ✓'
     else:
-        st.info('Streamlit Secrets에 APP_URL = "https://내앱.streamlit.app"을 설정하면 QR코드가 표시됩니다.')
-    if st.button("여행 닫기 · 데이터 유지", use_container_width=True):
-        st.session_state.clear()
-        st.rerun()
+        st.session_state.storage_ok=False
+        if req['mode']=='save':
+            st.session_state.doc=req['doc']
+            st.session_state.revision=st.session_state.get('revision',0)+1
+        st.warning('브라우저 저장소를 사용할 수 없습니다. 현재 작업은 임시입니다. 반드시 JSON 백업을 다운로드하세요.')
+
+
+def restore(key):
+    backup=st.file_uploader('JSON 백업',type=['json'],key=key)
+    confirm=st.checkbox('현재 여행을 백업 내용으로 교체합니다.',key=key+'confirm')
+    if st.button('백업 복원',key=key+'button',disabled=not backup or not confirm,use_container_width=True):
+        try:
+            raw=backup.getvalue()
+            if len(raw)>5_000_000: raise ValueError('백업 파일은 5MB 이하만 가능합니다.')
+            d=json.loads(raw);validate(d);persist(d)
+        except (ValueError,UnicodeError) as ex: st.error(str(ex))
+
+
+def create_trip():
+    st.caption('가입·접속 키 없이 시작하세요. 데이터는 현재 브라우저에 저장됩니다.')
+    with st.form('create'):
+        destination=st.text_input('여행지',placeholder='예: 제주도',max_chars=100)
+        selected=st.date_input('여행 기간',value=(today(),today()+timedelta(days=2)))
+        people=st.number_input('인원수',1,10000,2)
+        budget=st.number_input('전체 예산 (₩)',1,LIMIT,1000000,step=10000)
+        go=st.form_submit_button('🧳 여행 시작',type='primary',use_container_width=True)
+    if go:
+        try:
+            if len(selected)!=2: raise ValueError('시작일과 종료일을 선택하세요.')
+            persist(new_doc(destination,selected[0].isoformat(),selected[1].isoformat(),people,budget))
+        except ValueError as ex: st.error(str(ex))
+    with st.expander('📂 기존 백업으로 시작'): restore('initial_restore')
+
+
+def item_editor(d,key,plan=False,existing=None,seed=None):
+    b=existing or seed or {};a,z=date.fromisoformat(d['start']),date.fromisoformat(d['end'])
+    day=st.date_input('예정일' if plan else '지출일',value=date.fromisoformat(b['date']) if b else min(max(today(),a),z),min_value=a,max_value=z,key=key+'day')
+    cat=st.selectbox('카테고리',CATS,index=CATS.index(b.get('category',CATS[0])),format_func=lambda c:ICONS[CATS.index(c)]+' '+c,key=key+'cat')
+    desc=st.text_input('내용',value=b.get('description',''),max_chars=200,placeholder='예: 저녁 식사',key=key+'desc')
+    amount=int(st.number_input('예정 금액 (₩)' if plan else '실제 금액 (₩)',1,LIMIT,int(b.get('amount',10000)),step=1000,key=key+'amount'))
+    pri=st.selectbox('중요도',list(PRI),index=b.get('priority',1)-1,format_func=PRI.get,key=key+'pri')
+    e=dict(id=existing['id'] if existing else uuid.uuid4().hex,date=day.isoformat(),category=cat,description=desc.strip(),amount=amount,priority=pri)
+    accepted=True
+    if not plan:
+        exp=int(st.number_input('계획 금액 (₩, 0 = 미설정)',0,LIMIT,int(b.get('expected',seed['amount'] if seed else 0)),step=1000,key=key+'exp'))
+        pay=st.selectbox('결제 수단',PAY,index=PAY.index(b.get('payment',PAY[0])),key=key+'pay')
+        e.update(expected=exp,payment=pay,plan_id=existing.get('plan_id') if existing else (seed['id'] if seed else None))
+        after=totals(d)[1]+(existing['amount'] if existing else 0)-amount
+        warn=False
+        if exp and amount>exp: st.warning(f'계획보다 {won(amount-exp)} 비쌉니다. 구매·이용을 다시 검토하세요.');warn=True
+        if after<0: st.error(f'등록하면 전체 예산을 {won(-after)} 초과합니다.');warn=True
+        if warn:
+            sig=str((day,cat,desc,amount,exp,pay,pri))
+            accepted=st.checkbox('경고를 확인했고 직접 지출을 결정합니다.',key=key+'ack'+sig)
+    if st.button('계획 저장' if plan else '지출 확정 · 저장',key=key+'save',type='primary',disabled=not accepted,use_container_width=True):
+        updated=copy.deepcopy(d);field='plans' if plan else 'expenses'
+        if existing: updated[field]=[e if x['id']==existing['id'] else x for x in updated[field]]
+        else: updated[field].append(e)
+        persist(updated)
+
+
+def settings(d):
+    rev=str(st.session_state.get('revision',0))
+    dest=st.text_input('여행지',value=d['destination'],max_chars=100,key='dest'+rev)
+    selected=st.date_input('기간',value=(date.fromisoformat(d['start']),date.fromisoformat(d['end'])),key='range'+rev)
+    people=int(st.number_input('인원수',1,10000,d['people'],key='people'+rev))
+    budget=int(st.number_input('전체 예산 (₩)',1,LIMIT,d['budget'],step=10000,key='budget'+rev))
+    st.caption('1인당 '+won(budget//people)+' · 원 미만 버림')
+    if len(selected)!=2: st.info('시작·종료일을 선택하세요.');return
+    a,z=(x.isoformat() for x in selected)
+    try: labels=dates(a,z)
+    except ValueError as ex: st.error(str(ex));return
+    auto=st.checkbox('날짜·카테고리 예산 균등 재배분',key='auto'+rev)
+    day=split(budget,labels) if auto else {k:d['daily'].get(k,0) for k in labels}
+    cat=split(budget,CATS) if auto else d['category']
+    suffix=rev+str(budget)+a+z+str(auto)
+    config={'예산(원)':st.column_config.NumberColumn(min_value=0,max_value=LIMIT,step=1,required=True)}
+    st.caption('금액 셀을 눌러 수정 · 두 합계가 각각 전체 예산과 같아야 저장됩니다.')
+    df=st.data_editor(pd.DataFrame([{'날짜':k,'예산(원)':v} for k,v in day.items()]),disabled=['날짜'],hide_index=True,column_config=config,key='dayedit'+suffix,use_container_width=True)
+    cf=st.data_editor(pd.DataFrame([{'카테고리':k,'예산(원)':v} for k,v in cat.items()]),disabled=['카테고리'],hide_index=True,column_config=config,key='catedit'+suffix,use_container_width=True)
+    if not all(pd.notna(v) and math.isfinite(float(v)) and float(v).is_integer() and 0<=v<=LIMIT for v in list(df['예산(원)'])+list(cf['예산(원)'])):
+        st.error('빈칸·음수·소수 없이 입력하세요.');return
+    day=dict(zip(df['날짜'],map(int,df['예산(원)'])));cat=dict(zip(cf['카테고리'],map(int,cf['예산(원)'])))
+    equal=sum(day.values())==sum(cat.values())==budget
+    st.caption(f'날짜 합계 {won(sum(day.values()))} · 카테고리 합계 {won(sum(cat.values()))}')
+    if not equal: st.warning('각 합계를 전체 예산에 맞추세요.')
+    if st.button('설정 저장',disabled=not equal,type='primary',use_container_width=True):
+        updated=copy.deepcopy(d);updated.update(destination=dest.strip(),start=a,end=z,people=people,budget=budget,daily=day,category=cat);persist(updated)
 
 
 def main():
-    st.set_page_config(page_title="여행경비 최적화", page_icon="🧳", layout="centered")
+    st.set_page_config(page_title='여행경비 최적화',page_icon='🧳',layout='centered')
     st.markdown('''<style>
-    .stApp{background:#F6F9F5}.block-container{max-width:780px;padding-top:1.2rem;padding-bottom:2rem}
-    h1{font-size:1.8rem!important;letter-spacing:-1px}button,input{min-height:44px!important}
-    button{border-radius:12px!important}[data-testid="stExpander"]{border-radius:15px;background:#FFFFFFA0}
-    .summary{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:7px;margin:10px 0}
-    .tile{border-radius:15px;background:#E5F1EA;padding:14px 9px;border:1px solid #C9DDCF;min-width:0}
-    .tile small{color:#42634F;font-size:12px}.tile strong{display:block;font-size:clamp(14px,4.2vw,24px);color:#193E2D;overflow-wrap:anywhere;margin-top:4px}
-    .tile.danger{background:#FFEAE7;border-color:#F0B8B1}.tile.danger strong{color:#AD2E22}
-    @media(max-width:600px){.block-container{padding-left:12px;padding-right:12px}.summary{gap:5px}.tile{padding:11px 6px}}
-    </style>''', unsafe_allow_html=True)
-    st.title("🧳 여행경비 최적화")
-    try:
-        url = str(st.secrets["SUPABASE_URL"]).strip()
-        key = str(st.secrets["SUPABASE_SERVICE_ROLE_KEY"]).strip()
-        if not url.startswith("https://") or not key:
-            raise ValueError("설정 누락")
-    except (KeyError, FileNotFoundError, ValueError):
-        st.info("최초 설정이 필요합니다. app.py 맨 위 주석의 SQL을 Supabase에서 실행하고 Streamlit Secrets에 SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY를 추가하세요.")
-        st.stop()
-    store = Store(url, key)
-    if "ident" not in st.session_state:
-        login(store)
-    doc = st.session_state.doc
-    spent, left, count = stats(doc)
-    if "message" in st.session_state:
-        st.toast(st.session_state.pop("message"))
-    if st.session_state.get("new_trip"):
-        st.success("여행 생성 완료! 아래 비밀코드를 반드시 복사해 보관하세요.")
-        st.code(st.session_state.code, language=None)
-        if st.button("비밀코드를 보관했습니다", use_container_width=True):
-            st.session_state.new_trip = False
-            st.rerun()
-    st.caption(f"{doc['destination']} · {doc['start']} ~ {doc['end']} · {doc['people']}명")
-    st.markdown(f'''<div class="summary"><div class="tile"><small>전체 예산</small><strong>{won(doc['budget'])}</strong></div>
-    <div class="tile"><small>총지출</small><strong>{won(spent)}</strong></div>
-    <div class="tile {'danger' if left < 0 else ''}"><small>잔여 예산</small><strong>{won(left)}</strong></div></div>''', unsafe_allow_html=True)
-    st.progress(min(1.0, spent / doc["budget"]), text=f"예산 사용률 {spent / doc['budget']:.1%}")
-    st.caption(f"1인당 예산 {won(doc['budget'] // doc['people'])} · 1인당 지출 {won(spent // doc['people'])} · 원 미만 버림")
-    if count:
-        st.caption(f"남은 {count}일 · 하루 사용 가능 {won(max(0, left) // count)} · 한국시간, 오늘 포함")
-    else:
-        st.caption("여행 종료 · 전체 내역과 CSV를 확인하세요.")
-    if left < 0:
-        st.error(f"🚨 예산 {won(-left)} 초과! 추가 지출을 신중하게 결정하세요.")
-    plans = pending(doc)
-    shortfall = sum(p["amount"] for p in plans) - left
-    if shortfall > 0 and plans:
-        st.warning(f"미결제 계획까지 사용하면 {won(shortfall)} 부족합니다.")
-        with st.expander("💡 절약 후보 · 중요도 3 → 2"):
-            candidates = sorted([p for p in plans if p["priority"] in (3, 2)], key=lambda p: (-p["priority"], -p["amount"]))
-            for p in candidates:
-                st.write(f"{p['priority']} · {p['description']} · {won(p['amount'])}")
-            if candidates:
-                st.caption(f"전체 후보 생략 시 최대 {won(sum(p['amount'] for p in candidates))} 절약 가능. 취소 여부는 직접 결정하세요.")
-            else:
-                st.info("중요도 2·3 계획이 없습니다. 필수 지출과 전체 예산을 검토하세요.")
-            st.caption("이미 결제한 지출은 절약 후보 금액에 포함하지 않습니다.")
-    elif left <= doc["budget"] * 0.2:
-        st.warning("잔여 예산 20% 이하 · 중요도 3 지출부터 검토하세요.")
-
-    with st.expander("➕ 지출 등록"):
-        choices = {"direct": None} | {p["id"]: p for p in plans}
-        pick = st.selectbox("직접 입력 / 계획 결제", list(choices),
-                            format_func=lambda k: "직접 입력" if k == "direct" else label(choices[k]), key="add_choice")
-        item_editor(store, doc, f"add_{st.session_state.version}_{pick}_", seed=choices[pick])
-
-    with st.expander(f"📝 미결제 계획 · {len(plans)}건"):
-        st.caption("계획은 잔여 예산에서 차감하지 않습니다. 지출 등록에서 계획을 선택해 결제를 확정하세요.")
-        mode = st.radio("계획 작업", ["새 계획", "수정·삭제"], horizontal=True)
-        if mode == "새 계획":
-            item_editor(store, doc, f"newplan_{st.session_state.version}_", plan=True)
-        elif not plans:
-            st.info("미결제 계획이 없습니다.")
+    .stApp{background:#F5F8F4}.block-container{max-width:790px;padding-top:1rem;padding-bottom:2rem}h1{font-size:1.8rem!important}
+    button,input{min-height:44px!important}button{border-radius:12px!important}[data-testid="stExpander"]{background:#FFFFFFB0;border-radius:15px}
+    .tiles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:6px;margin:10px 0}.tile{background:#E3F0E8;border:1px solid #C6DECF;border-radius:15px;padding:13px 8px;min-width:0}
+    .tile small{font-size:12px;color:#486855}.tile strong{display:block;color:#18452C;font-size:clamp(14px,4vw,24px);overflow-wrap:anywhere;margin-top:5px}
+    .bad{background:#FFE8E4;border-color:#EBAEA5}.bad strong{color:#A8281F}
+    @media(max-width:600px){.block-container{padding-left:12px;padding-right:12px}.tile{padding:12px 6px}}
+    </style>''',unsafe_allow_html=True)
+    st.title('🧳 여행경비 최적화')
+    storage_gate()
+    d=st.session_state.get('doc')
+    if st.session_state.get('storage_invalid'):
+        st.warning('현재 브라우저 데이터가 손상되었습니다. 새 여행 저장은 기존 데이터를 덮어씁니다.')
+    if not st.session_state.get('storage_ok',False): st.warning('영구 저장이 확인되지 않았습니다. JSON 백업을 꼭 보관하세요.')
+    if d is None:
+        create_trip();return
+    if 'notice' in st.session_state: st.toast(st.session_state.pop('notice'))
+    spent,left,n=totals(d)
+    st.caption(f"{d['destination']} · {d['start']} ~ {d['end']} · {d['people']}명")
+    st.markdown(f'''<div class="tiles"><div class="tile"><small>전체 예산</small><strong>{won(d['budget'])}</strong></div><div class="tile"><small>총지출</small><strong>{won(spent)}</strong></div><div class="tile {'bad' if left<0 else ''}"><small>잔여 예산</small><strong>{won(left)}</strong></div></div>''',unsafe_allow_html=True)
+    st.progress(min(1.0,spent/d['budget']),text=f"예산 사용률 {spent/d['budget']:.1%}")
+    st.caption(f"1인당 예산 {won(d['budget']//d['people'])} · 지출 {won(spent//d['people'])} · 원 미만 버림")
+    st.caption(f'남은 {n}일 · 하루 사용 가능 {won(max(0,left)//n)} · 한국시간, 오늘 포함' if n else '여행 종료 · 전체 내역과 CSV를 확인하세요.')
+    if left<0: st.error(f'🚨 예산 {won(-left)} 초과! 추가 지출을 검토하세요.')
+    pp=pending(d);gap=sum(p['amount'] for p in pp)-left
+    if pp and gap>0:
+        st.warning(f'미결제 계획까지 지출하면 {won(gap)} 부족합니다.')
+        with st.expander('💡 절약 후보 · 중요도 3 → 2'):
+            candidates=sorted([p for p in pp if p['priority'] in (3,2)],key=lambda p:(-p['priority'],-p['amount']))
+            for p in candidates: st.write(f"중요도 {p['priority']} · {p['description']} · {won(p['amount'])}")
+            if not candidates: st.info('줄일 수 있는 계획이 없습니다. 필수 지출과 전체 예산을 검토하세요.')
+            st.caption('이미 결제한 지출은 제외됩니다. 취소·구매 여부는 직접 결정하세요.')
+    elif left<=d['budget']*.2: st.warning('잔여 예산 20% 이하 · 중요도 3 지출부터 검토하세요.')
+    rev=str(st.session_state.get('revision',0))
+    with st.expander('➕ 지출 등록',expanded=False):
+        choices={'direct':None}|{p['id']:p for p in pp}
+        pick=st.selectbox('입력 방식',list(choices),format_func=lambda k:'직접 입력' if k=='direct' else '계획 결제: '+label(choices[k]))
+        item_editor(d,'add'+rev+pick,seed=choices[pick])
+    with st.expander(f'📝 미결제 계획 · {len(pp)}건'):
+        st.caption('계획은 실제 잔여 예산에서 차감하지 않습니다. 지출 등록에서 결제 확정하세요.')
+        mode=st.radio('작업',['새 계획','수정·삭제'],horizontal=True)
+        if mode=='새 계획': item_editor(d,'plan'+rev,plan=True)
+        elif not pp: st.info('미결제 계획이 없습니다.')
         else:
-            by_id = {p["id"]: p for p in plans}
-            pid = st.selectbox("계획 선택", list(by_id), format_func=lambda k: label(by_id[k]))
-            item_editor(store, doc, f"editplan_{pid}_{st.session_state.version}_", plan=True, existing=by_id[pid])
-            checked = st.checkbox("이 계획을 삭제합니다.", key="delplan" + pid)
-            if st.button("계획 삭제", disabled=not checked, use_container_width=True):
-                updated = copy.deepcopy(doc)
-                updated["plans"] = [p for p in updated["plans"] if p["id"] != pid]
-                save(store, updated)
-
-    with st.expander("📊 계획 대비 실제 · 카테고리 / 날짜"):
-        analysis(doc)
-
-    with st.expander(f"📒 지출 내역 · {len(doc['expenses'])}건 · CSV"):
-        st.download_button("전체 CSV 다운로드", make_csv(doc), "travel_expenses.csv", "text/csv", use_container_width=True)
-        st.caption("CSV에는 실제 지출과 아직 결제하지 않은 계획이 구분되어 포함됩니다.")
-        if not doc["expenses"]:
-            st.info("등록한 지출이 없습니다.")
+            by={p['id']:p for p in pp};pid=st.selectbox('계획 선택',list(by),format_func=lambda k:label(by[k]))
+            item_editor(d,'planedit'+pid+rev,plan=True,existing=by[pid])
+            ok=st.checkbox('선택한 계획을 삭제합니다.',key='dp'+pid)
+            if st.button('계획 삭제',disabled=not ok,use_container_width=True):
+                updated=copy.deepcopy(d);updated['plans']=[p for p in updated['plans'] if p['id']!=pid];persist(updated)
+    with st.expander('📊 예산 대비 실제 · 카테고리 / 날짜'):
+        rows=[]
+        for cat in CATS:
+            actual=sum(e['amount'] for e in d['expenses'] if e['category']==cat)
+            rows.append({'카테고리':cat,'계획(원)':d['category'][cat],'실제(원)':actual,'잔여(원)':d['category'][cat]-actual,'비율(%)':round(actual/spent*100,1) if spent else 0.0})
+        frame=pd.DataFrame(rows).set_index('카테고리')
+        st.bar_chart(frame[['계획(원)','실제(원)']],stack=False,color=['#A6CDB7','#177B4B'])
+        st.dataframe(frame,use_container_width=True)
+        if spent:
+            top=max(rows,key=lambda r:r['실제(원)']);st.info(f"가장 큰 지출: {top['카테고리']} · {won(top['실제(원)'])} ({top['비율(%)']}%)")
+        daily=[]
+        for day in dates(d['start'],d['end']):
+            actual=sum(e['amount'] for e in d['expenses'] if e['date']==day)
+            daily.append({'날짜':day,'계획(원)':d['daily'][day],'실제(원)':actual,'잔여(원)':d['daily'][day]-actual})
+        st.dataframe(pd.DataFrame(daily).set_index('날짜'),use_container_width=True)
+        st.caption('잔여가 음수이면 해당 배정 예산을 초과한 상태입니다.')
+    with st.expander(f"📒 지출 내역 · {len(d['expenses'])}건 · CSV"):
+        st.download_button('CSV 다운로드',csv_data(d),'travel_expenses.csv','text/csv',use_container_width=True)
+        st.caption('실제 지출과 미결제 계획을 구분해서 내보냅니다.')
+        if not d['expenses']: st.info('등록된 지출이 없습니다.')
         else:
-            table = [{"날짜": e["date"], "카테고리": e["category"], "내용": e["description"], "금액(원)": e["amount"],
-                      "계획금액(원)": e["expected"], "중요도": e["priority"], "결제수단": e["payment"]}
-                     for e in sorted(doc["expenses"], key=lambda e: e["date"])]
-            st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
-            by_id = {e["id"]: e for e in doc["expenses"]}
-            eid = st.selectbox("수정할 지출", list(by_id), format_func=lambda k: label(by_id[k]))
-            item_editor(store, doc, f"edit_{eid}_{st.session_state.version}_", existing=by_id[eid])
-            checked = st.checkbox("이 지출을 삭제합니다. 연결된 계획은 미결제로 복원됩니다.", key="delexp" + eid)
-            if st.button("지출 삭제", disabled=not checked, use_container_width=True):
-                updated = copy.deepcopy(doc)
-                updated["expenses"] = [e for e in updated["expenses"] if e["id"] != eid]
-                save(store, updated)
+            table=[{'날짜':e['date'],'카테고리':e['category'],'내용':e['description'],'실제(원)':e['amount'],'계획(원)':e['expected'],'중요도':e['priority'],'결제수단':e['payment']} for e in sorted(d['expenses'],key=lambda e:e['date'])]
+            st.dataframe(pd.DataFrame(table),hide_index=True,use_container_width=True)
+            by={e['id']:e for e in d['expenses']};eid=st.selectbox('지출 선택',list(by),format_func=lambda k:label(by[k]))
+            item_editor(d,'edit'+eid+rev,existing=by[eid])
+            ok=st.checkbox('지출 삭제 · 연결된 계획은 미결제로 복원됩니다.',key='de'+eid)
+            if st.button('지출 삭제',disabled=not ok,use_container_width=True):
+                updated=copy.deepcopy(d);updated['expenses']=[e for e in updated['expenses'] if e['id']!=eid];persist(updated)
+    with st.expander('⚙️ 여행 정보 · 날짜별 / 카테고리별 예산'): settings(d)
+    with st.expander('💾 백업 · 복원 · 새 여행'):
+        st.download_button('전체 JSON 백업',json.dumps(d,ensure_ascii=False,indent=2),'travel_backup.json','application/json',use_container_width=True)
+        st.caption('사진이나 개인정보 없이 여행 데이터 전체를 백업합니다. 다른 기기에서는 이 JSON을 복원하세요.')
+        restore('restore')
+        st.divider()
+        ok=st.checkbox('새 여행 저장 시 기존 여행을 교체합니다. 먼저 JSON 백업을 보관했습니다.')
+        if ok: create_trip()
+    with st.expander('📱 QR코드로 앱 접속'):
+        address=st.text_input('배포한 앱 주소',placeholder='https://your-app.streamlit.app',max_chars=500)
+        if address:
+            try:
+                u=urlsplit(address.strip())
+                valid=u.scheme=='https' and bool(u.hostname) and not any([u.username,u.password,u.query,u.fragment]) and not any(c.isspace() for c in address.strip())
+            except ValueError: valid=False
+            if valid:
+                try:
+                    out=io.BytesIO();qrcode.make(address.strip()).save(out,format='PNG')
+                    st.image(out.getvalue(),width=190)
+                    st.download_button('QR PNG 다운로드',out.getvalue(),'travel_qr.png','image/png',use_container_width=True)
+                except (ValueError,qrcode.exceptions.DataOverflowError): st.warning('배포된 앱의 짧은 기본 주소를 입력하세요.')
+            else: st.warning('쿼리·로그인 정보가 없는 https 앱 주소를 입력하세요.')
+        st.caption('QR은 앱만 엽니다. 여행 데이터는 공유되지 않습니다. 다른 기기에는 JSON 백업을 복원하세요.')
+    with st.expander('↻ 다른 탭의 저장 내용 불러오기'):
+        st.warning('동시에 여러 탭에서 수정하면 나중에 저장한 내용이 덮어씁니다. 한 탭에서 사용하세요.')
+        if st.button('브라우저 저장소 다시 읽기',use_container_width=True):
+            st.session_state.storage_request={'mode':'load','token':uuid.uuid4().hex};st.rerun()
+    st.caption('이 기기·브라우저 자동 저장 · 사이트 데이터 삭제 시 소실 · JSON 백업 권장')
 
-    with st.expander("⚙️ 여행 정보 · 날짜별 / 카테고리별 예산"):
-        budget_settings(store, doc)
-    with st.expander("🔐 비밀코드 · QR 공유"):
-        sharing()
-    if st.button("↻ 새로 불러오기", use_container_width=True):
-        try:
-            row = store.load(st.session_state.ident)
-            if row:
-                validate(row["document"])
-                adopt(row)
-                st.rerun()
-            else:
-                st.error("여행 데이터를 찾을 수 없습니다.")
-        except (StorageError, ValueError) as exc:
-            st.error(str(exc))
-    st.caption("저장 즉시 현재 화면에 반영 · 다른 기기의 변경은 새로 불러오기 · 데이터는 Supabase에 보관")
 
-
-if __name__ == "__main__":
+if __name__=='__main__':
     main()
