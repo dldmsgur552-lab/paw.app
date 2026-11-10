@@ -1,1 +1,1 @@
-# paw.app
+# pay app
